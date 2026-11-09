@@ -190,6 +190,12 @@ class DoclingServeSettings(BaseSettings):
     # Local engine
     eng_loc_num_workers: int = 2
     eng_loc_share_models: bool = False
+    # Fail started tasks still running document_timeout x sources + this grace;
+    # a negative value disables the watchdog.
+    eng_loc_stuck_task_grace_s: float = 300.0
+    eng_loc_stuck_task_check_interval_s: float = 30.0
+    # Report not-live while an abandoned conversion thread is still running.
+    eng_loc_unhealthy_on_stuck_task: bool = True
     # RQ engine
     eng_rq_redis_url: str = ""
     eng_rq_queue_name: str = "convert"
@@ -528,6 +534,9 @@ class DoclingServeSettings(BaseSettings):
 
     @model_validator(mode="after")
     def engine_settings(self) -> Self:
+        if self.eng_loc_stuck_task_check_interval_s <= 0:
+            raise ValueError("eng_loc_stuck_task_check_interval_s must be positive.")
+
         if self.eng_kind == AsyncEngine.RQ:
             if not self.eng_rq_redis_url:
                 raise ValueError("RQ Redis url is required when using the RQ engine.")

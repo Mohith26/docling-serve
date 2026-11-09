@@ -98,6 +98,7 @@ from docling_jobkit.orchestrators.base_orchestrator import (
     RedisBackpressureError,
     TaskNotFoundError,
 )
+from docling_jobkit.orchestrators.local.orchestrator import LocalOrchestrator
 from docling_jobkit.orchestrators.rq.orchestrator import RQOrchestrator
 
 from docling_serve.auth import APIKeyAuth, AuthenticationResult
@@ -129,6 +130,10 @@ from docling_serve.public_errors import build_public_http_detail
 from docling_serve.response_preparation import prepare_response
 from docling_serve.settings import AsyncEngine, docling_serve_settings
 from docling_serve.storage import get_scratch
+from docling_serve.stuck_task_watchdog import (
+    STUCK_TASK_HEALTH_DETAIL,
+    LocalStuckTaskWatchdog,
+)
 from docling_serve.websocket_notifier import WebsocketNotifier
 
 # Pre-import OCR backends that use cysignals (signal handlers must be registered
@@ -168,6 +173,19 @@ _models_ready = asyncio.Event()
 # detect.
 _queue_processor_failed = asyncio.Event()
 
+# Local engine only: fails tasks whose conversion thread is stuck past its
+# deadline. Set in lifespan; while it holds an abandoned thread, liveness and
+# readiness fail so the platform restarts the pod and frees the worker slot.
+_stuck_task_watchdog: LocalStuckTaskWatchdog | None = None
+
+
+def _stuck_conversion_detected() -> bool:
+    return (
+        _stuck_task_watchdog is not None
+        and docling_serve_settings.eng_loc_unhealthy_on_stuck_task
+        and _stuck_task_watchdog.has_stuck_tasks()
+    )
+
 
 def _supervise_queue_processor(task: asyncio.Task, failed_event: asyncio.Event) -> None:
     """Mark the orchestrator loop unhealthy only if it died with an exception.
@@ -190,6 +208,7 @@ def _supervise_queue_processor(task: asyncio.Task, failed_event: asyncio.Event) 
 # Context manager to initialize and clean up the lifespan of the FastAPI app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _stuck_task_watchdog
     scratch_dir = get_scratch()
 
     orchestrator = get_async_orchestrator()
@@ -215,12 +234,26 @@ async def lifespan(app: FastAPI):
     if isinstance(orchestrator, RQOrchestrator):
         reaper_task = asyncio.create_task(orchestrator._reap_zombie_tasks())
 
+    watchdog_task = None
+    if (
+        isinstance(orchestrator, LocalOrchestrator)
+        and docling_serve_settings.eng_loc_stuck_task_grace_s >= 0
+    ):
+        _stuck_task_watchdog = LocalStuckTaskWatchdog(
+            orchestrator,
+            grace_seconds=docling_serve_settings.eng_loc_stuck_task_grace_s,
+            check_interval_seconds=docling_serve_settings.eng_loc_stuck_task_check_interval_s,
+        )
+        watchdog_task = asyncio.create_task(_stuck_task_watchdog.run())
+
     yield
 
     # Cancel the background queue processor on shutdown
     queue_task.cancel()
     if reaper_task:
         reaper_task.cancel()
+    if watchdog_task:
+        watchdog_task.cancel()
     try:
         await queue_task
     except asyncio.CancelledError:
@@ -230,6 +263,12 @@ async def lifespan(app: FastAPI):
             await reaper_task
         except asyncio.CancelledError:
             _log.info("Zombie reaper cancelled.")
+    if watchdog_task:
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            _log.info("Stuck-task watchdog cancelled.")
+    _stuck_task_watchdog = None
 
     # Remove scratch directory in case it was a tempfile
     if docling_serve_settings.scratch_path is not None:
@@ -789,6 +828,12 @@ def create_app():  # noqa: C901
                 detail="Background queue processor is not running.",
             )
 
+        if _stuck_conversion_detected():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=STUCK_TASK_HEALTH_DETAIL,
+            )
+
         orchestrator = get_async_orchestrator()
         try:
             await orchestrator.check_connection()
@@ -816,6 +861,13 @@ def create_app():  # noqa: C901
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Background queue processor is not running.",
+            )
+        # A conversion thread stuck past its deadline holds a worker slot that
+        # only a restart can free (local engine).
+        if _stuck_conversion_detected():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=STUCK_TASK_HEALTH_DETAIL,
             )
         return HealthCheckResponse()
 

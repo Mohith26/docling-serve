@@ -281,6 +281,9 @@ The following table describes the options to configure the Docling Serve local e
 |-----|---------|-------------|
 | `DOCLING_SERVE_ENG_LOC_NUM_WORKERS` | 2 | Number of workers/threads processing the incoming tasks. |
 | `DOCLING_SERVE_ENG_LOC_SHARE_MODELS` | False | If true, each process will share the same models among all thread workers. Otherwise, one instance of the models is allocated for each worker thread. |
+| `DOCLING_SERVE_ENG_LOC_STUCK_TASK_GRACE_S` | `300` | A conversion that hangs inside a single call (for example a native parser or OCR call that never returns) is not interrupted by `document_timeout`, so its task would stay `started` forever and keep a worker busy. A watchdog fails any started task that is still running after `document_timeout` times its number of sources plus this grace, with an error message saying the conversion was abandoned. Without a request `document_timeout`, `DOCLING_SERVE_MAX_DOCUMENT_TIMEOUT` is used. Set a negative value to disable the watchdog. |
+| `DOCLING_SERVE_ENG_LOC_STUCK_TASK_CHECK_INTERVAL_S` | `30` | Seconds between two watchdog scans. |
+| `DOCLING_SERVE_ENG_LOC_UNHEALTHY_ON_STUCK_TASK` | `true` | Python cannot stop the thread of an abandoned conversion. When enabled, `/livez` and `/ready` return 503 while such a thread is still running, so the platform restarts the server and the worker comes back. A restart drops the tasks and results the local engine keeps in memory; set to `false` to only fail the stuck task. |
 
 #### RQ engine
 
